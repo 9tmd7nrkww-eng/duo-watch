@@ -95,6 +95,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 BASE = f"https://www.apple.com/{COUNTRY}"
+ALL_FAILED = False
 
 
 def http_get(url, timeout=20):
@@ -116,7 +117,7 @@ def fulfilment_url(part, postcode):
         "searchNearby": "true",
         "location": postcode,
     }
-    return f"{BASE}/shop/fulfillment-messages?" + urllib.parse.urlencode(q)
+    return f"{BASE}/shop/fulfillment-messages?" + urllib.parse.urlencode(q, safe="/")
 
 
 def parse_response(payload, part):
@@ -169,6 +170,7 @@ def check_once(state):
     for part, label in PARTS.items():
         seen = {}          # store_key -> (name, available) merged across postcodes
         online_now = False
+        failures = 0
         for pc in POSTCODES:
             try:
                 payload = json.loads(http_get(fulfilment_url(part, pc)))
@@ -176,10 +178,20 @@ def check_once(state):
                 if e.code in (403, 429, 503):
                     print(f"  ! Apple returned {e.code}; backing off", file=sys.stderr)
                     return None
-                print(f"  ! {pc}: HTTP {e.code}", file=sys.stderr)
+                failures += 1
+                if failures == 1:  # show Apple's own error text once, so we can diagnose
+                    try:
+                        body = e.read()[:400].decode("utf-8", "replace")
+                    except Exception:
+                        body = ""
+                    print(f"  ! {pc}: HTTP {e.code}. URL: {fulfilment_url(part, pc)}")
+                    print(f"  ! Apple said: {body!r}")
+                    print(f"  ! Headers: {dict(e.headers)}")
                 continue
             except Exception as e:
-                print(f"  ! {pc}: {e}", file=sys.stderr)
+                failures += 1
+                if failures == 1:
+                    print(f"  ! {pc}: {e}")
                 continue
             stores, online = parse_response(payload, part)
             online_now = online_now or online
@@ -187,6 +199,19 @@ def check_once(state):
                 prev = seen.get(k)
                 seen[k] = (v[0], v[1] or (prev[1] if prev else False))
             time.sleep(1.0)  # be gentle between lookups
+
+        if failures == len(POSTCODES):
+            # Every lookup failed: do not pretend all is well, and keep old state.
+            global ALL_FAILED
+            ALL_FAILED = True
+            print(f"[{time.strftime('%H:%M:%S')}] {label}: ALL {failures} lookups failed")
+            if not state.get(part, {}).get("broken"):
+                notify("Duo watcher is not working",
+                       f"Apple rejected every availability lookup for {label}. Check the GitHub run log.",
+                       priority="default")
+            state.setdefault(part, {})["broken"] = True
+            save_state(state)
+            continue
 
         in_stock = {k: v[0] for k, v in seen.items() if v[1]}
         print(f"[{time.strftime('%H:%M:%S')}] {label}: {len(seen)} stores seen, "
@@ -246,6 +271,8 @@ def main():
     while True:
         result = check_once(state)
         if args.once:
+            if ALL_FAILED:
+                sys.exit(1)  # makes the GitHub run show red instead of a false green
             return
         if result is None:
             delay = min(delay * 2, 1800)
