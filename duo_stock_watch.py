@@ -1,32 +1,27 @@
 #!/usr/bin/env python3
 """
-iPhone Duo stock watcher for Apple UK stores.
+iPhone Duo stock watcher for Apple UK (online delivery estimates).
 
-What it does
-  * Polls Apple's own store-pickup availability endpoint (the same one the
-    "Check availability" box on apple.com/uk uses) for your chosen model(s),
-    across a spread of UK postcodes so it covers stores nationwide.
-  * Sends a phone push notification (via ntfy.sh, free, no account) the moment a
-    store flips from "unavailable" to "available", with a tap-through link.
-  * Alerts on changes only, so you are not spammed every poll.
+How it works
+  Apple's per-store pickup lookup is not available to us, so this watches the
+  same delivery estimate you see on the Duo buy page ("Ships 22 Jan"). When
+  stock lands, that estimate suddenly gets much sooner. You get a phone push
+  (via ntfy.sh) when, for any watched model:
+    * the estimate becomes SOON_DAYS days away or less (or says today/tomorrow), or
+    * the estimate improves by IMPROVE_DAYS days or more since the last check.
+  Tapping the notification opens the Duo buy page so you can order.
 
-Setup (5 minutes)
-  1. Python 3.8+ is all you need. No packages to install.
-  2. Install the free "ntfy" app on your phone, subscribe to a long, random topic
-     name, and put the same name in NTFY_TOPIC below.
-  3. Find your part number(s): run   python duo_stock_watch.py --discover
-     (or open the Duo buy page, pick colour + storage, and look for a code like
-     MXXXXQN/A in the page source). Paste them into PARTS below.
-  4. Run:  python duo_stock_watch.py            (loops forever)
-           python duo_stock_watch.py --once     (single check, for testing / cron)
-           python duo_stock_watch.py --test     (sends a test notification)
+Cloud mode (GitHub Actions) reads settings from environment variables:
+  NTFY_TOPIC   your ntfy topic
+  PARTS        PART1=Label one;PART2=Label two
 
-Leave it running on something that stays on (a Raspberry Pi, a spare PC, a cheap
-VPS). A laptop that sleeps will miss restocks.
+Commands
+  python duo_stock_watch.py --discover   list Duo part numbers + current estimates
+  python duo_stock_watch.py --test       send a test notification
+  python duo_stock_watch.py --once       one check (what GitHub runs every 5 min)
+  python duo_stock_watch.py              loop forever (for a Pi / PC / server)
 
-Be polite: keep POLL_SECONDS at 60 or more. If Apple returns 403/429 the script
-backs off automatically. It only reads availability; it never logs in, adds to
-bag, or buys anything for you.
+It only reads public delivery estimates. It never logs in, adds to bag or buys.
 """
 
 import argparse
@@ -36,57 +31,28 @@ import re
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
+from datetime import date
 from pathlib import Path
 
 # ----------------------------- CONFIG ---------------------------------------
 
-# Part numbers to watch -> friendly label. Fill these in (see --discover).
 PARTS = {
-    # "MXXXXQN/A": "Duo 256GB Night Sky",
-    # "MXXXYQN/A": "Duo 256GB Star White",
+    # "MK2E4QN/A": "Duo 256GB Night Sky",
 }
-# Cloud mode: set a PARTS environment variable instead, formatted
-#   PART1=Label one;PART2=Label two
 if os.environ.get("PARTS"):
     for _item in os.environ["PARTS"].split(";"):
         if "=" in _item:
             _p, _l = _item.split("=", 1)
             PARTS[_p.strip()] = _l.strip()
 
-# Your ntfy topic (make it long and unguessable; anyone who knows it can read it).
-# In cloud mode it is read from the NTFY_TOPIC environment variable.
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or "change-me-to-something-long-and-random"
 
-# Postcodes spread across the UK. Each lookup returns the stores nearest to that
-# postcode, so more spread = better national coverage. Add/remove freely.
-POSTCODES = [
-    "WS10 0AA",   # Wednesbury / West Midlands
-    "B1 1AA",     # Birmingham
-    "SW1A 1AA",   # London (central)
-    "E20 1EJ",    # London (east)
-    "M1 1AE",     # Manchester
-    "L1 8JQ",     # Liverpool
-    "LS1 1UR",    # Leeds
-    "S1 2GU",     # Sheffield
-    "NE1 4ST",    # Newcastle
-    "G1 1XQ",     # Glasgow
-    "EH1 1YZ",    # Edinburgh
-    "CF10 1EP",   # Cardiff
-    "BS1 3XD",    # Bristol
-    "SO14 7FP",   # Southampton
-    "BN1 1AA",    # Brighton
-    "NG1 2GE",    # Nottingham
-    "CB2 1TN",    # Cambridge
-    "NR1 3QA",    # Norwich
-    "BT1 5GS",    # Belfast
-]
-
-COUNTRY = "uk"          # apple.com/<country>
-POLL_SECONDS = 90       # minimum sensible value is ~60
-ALSO_CHECK_ONLINE = True  # also report if Apple's online store shows it buyable
-STATE_FILE = Path(__file__).with_name("duo_stock_state.json")
+COUNTRY = "uk"
+POLL_SECONDS = 120      # loop mode only; keep at 60 or more
+SOON_DAYS = 7           # alert if the estimate is this many days away or less
+IMPROVE_DAYS = 7        # ...or if it improves by at least this many days
+STATE_FILE = Path(os.environ.get("STATE_FILE") or Path(__file__).with_name("duo_stock_state.json"))
 
 # ----------------------------------------------------------------------------
 
@@ -95,46 +61,55 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 BASE = f"https://www.apple.com/{COUNTRY}"
+BUY_PAGE = f"{BASE}/shop/buy-iphone/iphone-duo"
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+NEG = re.compile(r"unavailable|not available|out of stock|sold out|currently", re.I)
 ALL_FAILED = False
 
 
 def http_get(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json,text/html"})
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
 
 
-def product_link(part):
-    return f"{BASE}/shop/product/{part}"
+def delivery_url(parts):
+    q = "&".join(f"parts.{i}={p}" for i, p in enumerate(parts))
+    return f"{BASE}/shop/delivery-message?{q}&little=true"
 
 
-def fulfilment_url(part, postcode):
-    q = {
-        "pl": "true",
-        "mts.0": "regular",
-        "mts.1": "compact",
-        "parts.0": part,
-        "searchNearby": "true",
-        "location": postcode,
-    }
-    return f"{BASE}/shop/fulfillment-messages?" + urllib.parse.urlencode(q, safe="/")
+def parse_days(text, today=None):
+    """Days until the earliest date in the message, or None if there isn't one."""
+    today = today or date.today()
+    if re.search(r"\btoday\b", text, re.I):
+        return 0
+    if re.search(r"\btomorrow\b", text, re.I):
+        return 1
+    m = re.search(r"\b(\d{1,2})(?:\s*[-–]\s*\d{1,2})?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", text, re.I)
+    if not m:
+        return None
+    try:
+        d = date(today.year, MONTHS[m.group(2).lower()], int(m.group(1)))
+    except ValueError:
+        return None
+    if (d - today).days < -30:
+        d = date(d.year + 1, d.month, d.day)
+    return (d - today).days
 
 
-def parse_response(payload, part):
-    """Return (stores, online_buyable). stores = {store_key: (name, available_bool)}"""
-    body = payload.get("body", {}).get("content", {})
-    stores = {}
-    for s in body.get("pickupMessage", {}).get("stores", []) or []:
-        avail = (s.get("partsAvailability", {}) or {}).get(part, {}) or {}
-        name = f'{s.get("storeName", "?")} ({s.get("city", "")})'.replace(" ()", "")
-        key = s.get("storeNumber") or name
-        stores[key] = (name, str(avail.get("pickupDisplay", "")).lower() == "available")
-    online = False
-    dm = (body.get("deliveryMessage", {}) or {}).get(part, {}) or {}
-    reg = dm.get("regular", {}) or {}
-    if reg.get("isBuyable") is True:
-        online = True
-    return stores, online
+def messages(regular):
+    out = []
+    for m in regular.get("deliveryOptionMessages") or []:
+        if isinstance(m, dict) and m.get("displayName"):
+            out.append(str(m["displayName"]))
+    if not out:
+        for o in regular.get("deliveryOptions") or []:
+            if isinstance(o, dict):
+                for k in ("displayName", "date"):
+                    if o.get(k):
+                        out.append(str(o[k]))
+    return out
 
 
 def notify(title, message, click=None, priority="urgent"):
@@ -164,140 +139,110 @@ def save_state(state):
         print(f"  ! could not save state: {e}", file=sys.stderr)
 
 
+def mark_broken(state, why):
+    global ALL_FAILED
+    ALL_FAILED = True
+    print(f"  ! {why}")
+    if not state.get("_broken"):
+        notify("Duo watcher is not working", f"{why} Check the GitHub run log.", priority="default")
+    state["_broken"] = True
+    save_state(state)
+
+
 def check_once(state):
-    """One full sweep. Returns number of alerts sent, or None if Apple blocked us."""
-    alerts = 0
-    for part, label in PARTS.items():
-        seen = {}          # store_key -> (name, available) merged across postcodes
-        online_now = False
-        failures = 0
-        for pc in POSTCODES:
-            try:
-                payload = json.loads(http_get(fulfilment_url(part, pc)))
-            except urllib.error.HTTPError as e:
-                if e.code in (403, 429, 503):
-                    print(f"  ! Apple returned {e.code}; backing off", file=sys.stderr)
-                    return None
-                failures += 1
-                if failures == 1:  # show Apple's own error text once, so we can diagnose
-                    try:
-                        body = e.read()[:400].decode("utf-8", "replace")
-                    except Exception:
-                        body = ""
-                    print(f"  ! {pc}: HTTP {e.code}. URL: {fulfilment_url(part, pc)}")
-                    print(f"  ! Apple said: {body!r}")
-                    print(f"  ! Headers: {dict(e.headers)}")
-                continue
-            except Exception as e:
-                failures += 1
-                if failures == 1:
-                    print(f"  ! {pc}: {e}")
-                continue
-            stores, online = parse_response(payload, part)
-            online_now = online_now or online
-            for k, v in stores.items():
-                prev = seen.get(k)
-                seen[k] = (v[0], v[1] or (prev[1] if prev else False))
-            time.sleep(1.0)  # be gentle between lookups
+    """One check of every watched part. Returns alert count, or None if Apple blocked us."""
+    parts = list(PARTS)
+    try:
+        payload = json.loads(http_get(delivery_url(parts)))
+    except urllib.error.HTTPError as e:
+        if e.code in (403, 429, 503):
+            print(f"  ! Apple returned {e.code}; backing off", file=sys.stderr)
+            return None
+        mark_broken(state, f"Apple returned HTTP {e.code}.")
+        return 0
+    except Exception as e:
+        mark_broken(state, f"Request failed: {e}")
+        return 0
 
-        if failures == len(POSTCODES):
-            # Every lookup failed: do not pretend all is well, and keep old state.
-            global ALL_FAILED
-            ALL_FAILED = True
-            print(f"[{time.strftime('%H:%M:%S')}] {label}: ALL {failures} lookups failed")
-            if not state.get(part, {}).get("broken"):
-                notify("Duo watcher is not working",
-                       f"Apple rejected every availability lookup for {label}. Check the GitHub run log.",
-                       priority="default")
-            state.setdefault(part, {})["broken"] = True
-            save_state(state)
+    content = (payload.get("body", {}).get("content", {}) or {}).get("deliveryMessage", {}) or {}
+    alerts = failed = 0
+    for n, (part, label) in enumerate(PARTS.items()):
+        regular = (content.get(part) or {}).get("regular") or {}
+        if n == 0:
+            print("   raw:", json.dumps(regular)[:500])
+        text = " / ".join(messages(regular))
+        if not text:
+            failed += 1
+            print(f"[{time.strftime('%H:%M:%S')}] {label}: no delivery message returned")
             continue
-
-        in_stock = {k: v[0] for k, v in seen.items() if v[1]}
-        print(f"[{time.strftime('%H:%M:%S')}] {label}: {len(seen)} stores seen, "
-              f"{len(in_stock)} with stock, online={'yes' if online_now else 'no'}")
-
-        prev_stores = set(state.get(part, {}).get("stores", []))
-        for k, name in in_stock.items():
-            if k not in prev_stores:
-                notify(f"{label} in stock: {name}",
-                       f"Apple shows {label} available for pickup at {name}. Tap to open and reserve.",
-                       click=product_link(part))
-                alerts += 1
-        if ALSO_CHECK_ONLINE and online_now and not state.get(part, {}).get("online"):
-            notify(f"{label} buyable online", f"Apple's online store shows {label} as buyable.",
-                   click=product_link(part))
+        days = parse_days(text)
+        signal = (not NEG.search(text)) and (
+            (days is not None and days <= SOON_DAYS)
+            or bool(re.search(r"\b(today|tomorrow|in stock|available)\b", text, re.I))
+        )
+        prev = state.get(part, {}) if isinstance(state.get(part), dict) else {}
+        pdays = prev.get("days")
+        improved = days is not None and pdays is not None and days <= pdays - IMPROVE_DAYS
+        print(f"[{time.strftime('%H:%M:%S')}] {label}: {text} "
+              f"({'no date' if days is None else str(days) + ' days'})"
+              f"{'  <-- STOCK SIGNAL' if signal else ''}{'  <-- IMPROVED' if improved else ''}")
+        if (signal and not prev.get("signal")) or improved:
+            was = f" (was: {prev['text']})" if prev.get("text") else ""
+            notify(f"{label}: {text}",
+                   f"Apple UK now shows \"{text}\" for {label}{was}. Tap to open the buy page and order.",
+                   click=BUY_PAGE)
             alerts += 1
+        state[part] = {"text": text, "days": days, "signal": signal}
 
-        state[part] = {"stores": list(in_stock.keys()), "online": online_now}
-        save_state(state)
+    if failed == len(PARTS):
+        mark_broken(state, "Apple returned no delivery message for any watched model.")
+        return 0
+    state["_broken"] = False
+    save_state(state)
     return alerts
 
 
 def discover():
-    url = f"{BASE}/shop/buy-iphone/iphone-duo"
-    print(f"Fetching {url} ...")
-    html = http_get(url)
-    found = sorted(set(re.findall(r"\b[A-Z0-9]{5,6}[A-Z]{1,2}/A\b", html)))
-    if not found:
-        print("No part numbers found automatically. Open the page in a browser, choose a "
-              "colour and storage, then search the page source for '/A'.")
+    print(f"Fetching {BUY_PAGE} ...")
+    html = http_get(BUY_PAGE)
+    named = re.findall(r'"partNumber":"([A-Z0-9]+/A)","price":\{[^}]*\},"category":"iphone","name":"([^"]+)"', html)
+    if not named:
+        print("Could not read model names from the page. Raw candidates:")
+        for p in sorted(set(re.findall(r"\b[A-Z0-9]{5,6}[A-Z]{1,2}/A\b", html))):
+            print("  ", p)
         return
-    print("Candidate part numbers (check each against the page; not all will be Duos):")
-    for p in found:
-        print("  ", p)
-    probe(html, found)
-
-
-def _short(text, n=260):
-    m = re.search(r"<title>(.*?)</title>", text, re.S | re.I)
-    if m:
-        return "HTML page titled: " + m.group(1).strip()
-    return " ".join(text.split())[:n]
-
-
-def probe(html, found):
-    """Diagnostics: try several Apple availability URLs for one Duo part and one control part."""
-    duo = [p for p in (list(PARTS) + found) if p.startswith("MK2")][:1]
-    control = [p for p in found if not p.startswith("MK2")][:1]
-    print("\n=== PROBE: which Apple availability URLs answer? ===")
-    for part in duo + control:
-        print(f"\n-- part {part}")
-        i = html.find(part)
-        if i >= 0:
-            print("   context on buy page:", " ".join(html[max(0, i - 160): i + 160].split()))
-        enc = urllib.parse.quote(part, safe="")
-        variants = [
-            ("pickup (slash kept)", fulfilment_url(part, "B1 1AA")),
-            ("pickup (slash encoded)", fulfilment_url(part, "B1 1AA").replace(part, enc)),
-            ("pickup (minimal params)",
-             f"{BASE}/shop/fulfillment-messages?parts.0={part}&mts.0=regular&searchNearby=true&location=B1+1AA"),
-            ("delivery-message", f"{BASE}/shop/delivery-message?parts.0={part}&little=true"),
-        ]
-        for name, url in variants:
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
-                with urllib.request.urlopen(req, timeout=20) as r:
-                    print(f"   [{r.status}] {name}: {_short(r.read().decode('utf-8', 'replace'))}")
-            except urllib.error.HTTPError as e:
-                print(f"   [{e.code}] {name}: {_short(e.read().decode('utf-8', 'replace'))}")
-            except Exception as e:
-                print(f"   [ERR] {name}: {e}")
-            time.sleep(1.0)
-    print("\n=== PROBE DONE ===")
+    seen, models = set(), []
+    for p, name in named:
+        if p not in seen:
+            seen.add(p)
+            models.append((p, name))
+    print("\nDuo models found:")
+    for p, name in models:
+        print(f"  {p}={name}")
+    print("\nCurrent Apple UK delivery estimates:")
+    try:
+        data = json.loads(http_get(delivery_url([p for p, _ in models])))
+        dm = data.get("body", {}).get("content", {}).get("deliveryMessage", {}) or {}
+        for p, name in models:
+            txt = " / ".join(messages((dm.get(p) or {}).get("regular") or {})) or "(no message)"
+            print(f"  {name}: {txt}")
+    except Exception as e:
+        print(f"  (could not fetch estimates: {e})")
+    print("\nPARTS value for everything:")
+    print(";".join(f"{p}={name}" for p, name in models))
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--once", action="store_true", help="single sweep then exit")
+    ap.add_argument("--once", action="store_true", help="single check then exit")
     ap.add_argument("--test", action="store_true", help="send a test notification")
-    ap.add_argument("--discover", action="store_true", help="try to find part numbers")
+    ap.add_argument("--discover", action="store_true", help="list Duo part numbers and estimates")
     args = ap.parse_args()
 
     if args.discover:
         return discover()
     if args.test:
-        notify("Duo watcher test", "If you can read this, notifications work.", click=f"{BASE}/shop/buy-iphone/iphone-duo")
+        notify("Duo watcher test", "If you can read this, notifications work.", click=BUY_PAGE)
         print("Test notification sent.")
         return
     if not PARTS:
@@ -311,12 +256,9 @@ def main():
         result = check_once(state)
         if args.once:
             if ALL_FAILED:
-                sys.exit(1)  # makes the GitHub run show red instead of a false green
+                sys.exit(1)  # make the GitHub run show red instead of a false green
             return
-        if result is None:
-            delay = min(delay * 2, 1800)
-        else:
-            delay = POLL_SECONDS
+        delay = min(delay * 2, 1800) if result is None else POLL_SECONDS
         time.sleep(delay)
 
 
