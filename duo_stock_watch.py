@@ -246,6 +246,45 @@ def discover():
     print("Candidate part numbers (check each against the page; not all will be Duos):")
     for p in found:
         print("  ", p)
+    probe(html, found)
+
+
+def _short(text, n=260):
+    m = re.search(r"<title>(.*?)</title>", text, re.S | re.I)
+    if m:
+        return "HTML page titled: " + m.group(1).strip()
+    return " ".join(text.split())[:n]
+
+
+def probe(html, found):
+    """Diagnostics: try several Apple availability URLs for one Duo part and one control part."""
+    duo = [p for p in (list(PARTS) + found) if p.startswith("MK2")][:1]
+    control = [p for p in found if not p.startswith("MK2")][:1]
+    print("\n=== PROBE: which Apple availability URLs answer? ===")
+    for part in duo + control:
+        print(f"\n-- part {part}")
+        i = html.find(part)
+        if i >= 0:
+            print("   context on buy page:", " ".join(html[max(0, i - 160): i + 160].split()))
+        enc = urllib.parse.quote(part, safe="")
+        variants = [
+            ("pickup (slash kept)", fulfilment_url(part, "B1 1AA")),
+            ("pickup (slash encoded)", fulfilment_url(part, "B1 1AA").replace(part, enc)),
+            ("pickup (minimal params)",
+             f"{BASE}/shop/fulfillment-messages?parts.0={part}&mts.0=regular&searchNearby=true&location=B1+1AA"),
+            ("delivery-message", f"{BASE}/shop/delivery-message?parts.0={part}&little=true"),
+        ]
+        for name, url in variants:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    print(f"   [{r.status}] {name}: {_short(r.read().decode('utf-8', 'replace'))}")
+            except urllib.error.HTTPError as e:
+                print(f"   [{e.code}] {name}: {_short(e.read().decode('utf-8', 'replace'))}")
+            except Exception as e:
+                print(f"   [ERR] {name}: {e}")
+            time.sleep(1.0)
+    print("\n=== PROBE DONE ===")
 
 
 def main():
