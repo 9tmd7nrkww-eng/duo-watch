@@ -36,8 +36,9 @@ jobs:
           PARTS: ${{ vars.PARTS }}
           MODE: ${{ inputs.mode || 'watch' }}
         run: |
-          if [ "$MODE" = "discover" ]; then python duo_stock_watch.py --discover
-          elif [ "$MODE" = "test" ]; then python duo_stock_watch.py --test
+          MODE=$(echo "$MODE" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+          if [ "$MODE" = "test" ]; then python duo_stock_watch.py --test
+          elif [ "$MODE" = "discover" ] || [ -z "$PARTS" ]; then python duo_stock_watch.py --discover
           else python duo_stock_watch.py --once
           fi
 
